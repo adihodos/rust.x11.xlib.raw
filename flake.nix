@@ -47,9 +47,17 @@
           cargo-edit
           cargo-watch
           rust-analyzer
+          gdb
 
+          xorg.libxcb
+          xorg.libxcb.dev
           xorg.libX11
           xorg.libX11.dev
+          xorg.xcbutil.dev
+          xorg.xcbutilwm
+          xorg.xcbutilrenderutil
+          xorg.libXrandr
+          xorg.libXrandr.dev
         ];
 
         env = {

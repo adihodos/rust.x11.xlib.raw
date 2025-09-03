@@ -5,3 +5,6 @@
 - [X11 programming guides](https://www.x.org/releases/X11R7.6/doc/)
 - [Rust Core library](https://doc.rust-lang.org/core/)
 
+## Build steps
+```rustc -o playground playground.rs && ./playground```
+

@@ -1,3 +1,5 @@
+#![allow(non_camel_case_types)]
+
 #[repr(C)]
 struct Display {
     _data: (),
@@ -273,6 +275,7 @@ pub fn main() {
     let atom_wm_delete = unsafe {
         XStoreName(display, window, b"X11 + Rust\0".as_ptr());
         let wm_delete_window = XInternAtom(display, b"WM_DELETE_WINDOW\0".as_ptr(), false as i32);
+        dbg!(wm_delete_window);
         let res = XSetWMProtocols(display, window, &wm_delete_window as *const _, 1);
         assert_ne!(res, 0);
         XMapRaised(display, window);
