@@ -1,3 +1,4 @@
+#![crate_name = "rust_xcb"]
 #![allow(non_camel_case_types)]
 
 #[repr(C)]
@@ -293,9 +294,56 @@ unsafe extern "C" {
 
 }
 
-unsafe extern "C" {
-    fn free(ptr: *mut core::ffi::c_void);
-    fn fcntl(fildes: i32, cmd: i32, ...) -> i32;
+mod libc {
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    pub union epoll_data_t {
+        pub ptr: *mut core::ffi::c_void,
+        pub fd: i32,
+        pub u32_: u32,
+        pub u64_: u64,
+    }
+
+    #[derive(Copy, Clone)]
+    #[repr(C, packed)]
+    pub struct epoll_event {
+        pub events: u32,
+        pub data: epoll_data_t,
+    }
+
+    pub const EAGAIN: i32 = 11;
+
+    pub const F_GETFL: i32 = 3;
+    pub const F_SETFL: i32 = 4;
+    pub const O_NONBLOCK: i32 = 04000;
+
+    pub const EPOLL_CTL_ADD: i32 = 1;
+
+    pub const EPOLLIN: i32 = 1;
+    pub const EPOLLERR: i32 = 8;
+    pub const EPOLLHUP: i32 = 10;
+    pub const EPOLLET: i32 = 1 << 31;
+
+    unsafe extern "C" {
+        pub fn free(ptr: *mut core::ffi::c_void);
+        pub fn fcntl(fildes: i32, cmd: i32, ...) -> i32;
+
+        pub fn epoll_create(size: i32) -> i32;
+        pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, epoll_event: *mut epoll_event) -> i32;
+        pub fn epoll_wait(epfd: i32, events: *mut epoll_event, maxevents: i32, timeout: i32)
+            -> i32;
+
+        pub fn read(fd: i32, buf: *mut u8, count: usize) -> i32;
+    }
+
+    #[link(name = "pthread")]
+    unsafe extern "C" {
+        fn __errno_location() -> *mut i32;
+    }
+
+    pub fn errno() -> i32 {
+        unsafe { *__errno_location() }
+    }
 }
 
 fn get_xcb_atom_by_name(xcb_conn: *mut xcb_connection_t, atom_name: &[u8]) -> xcb_atom_t {
@@ -309,7 +357,7 @@ fn get_xcb_atom_by_name(xcb_conn: *mut xcb_connection_t, atom_name: &[u8]) -> xc
         let atom_reply = xcb_intern_atom_reply(xcb_conn, cookie, core::ptr::null_mut());
         assert_ne!(atom_reply, core::ptr::null_mut());
         let atomid = (*atom_reply).atom;
-        free(atom_reply as *mut _);
+        libc::free(atom_reply as *mut _);
         atomid
     }
 }
@@ -362,7 +410,6 @@ mod xrandr {
     #[link(name = "xcb-randr")]
     #[link(name = "xcb-util")]
     unsafe extern "C" {
-
         pub fn xcb_randr_get_monitors(
             c: *mut xcb_connection_t,
             window: xcb_window_t,
@@ -487,6 +534,12 @@ impl SimpleDrawing {
 }
 
 fn main() {
+    eprintln!(
+        "Sizeof epoll_event = {}, align = {}",
+        std::mem::size_of::<libc::epoll_event>(),
+        std::mem::align_of::<libc::epoll_event>()
+    );
+
     let (xcb_conn, screen) = unsafe {
         let mut screen = 0i32;
         (
@@ -503,8 +556,6 @@ fn main() {
 
     let xcb_fd = unsafe { xcb_get_file_descriptor(xcb_conn) };
     dbg!(xcb_fd);
-    let fd_flags = unsafe { fcntl(xcb_fd, 1) };
-    dbg!(fd_flags);
 
     let xcb_setup = unsafe { xcb_get_setup(xcb_conn) };
     dbg!(unsafe { *xcb_setup });
@@ -601,49 +652,165 @@ fn main() {
         );
     }
 
-    let mut context = SimpleDrawing::new(xcb_conn, windowid).unwrap();
+    let mut app_context = SimpleDrawing::new(xcb_conn, windowid).unwrap();
 
     unsafe {
         xcb_map_window(xcb_conn, windowid);
         xcb_flush(xcb_conn);
     }
 
+    #[derive(Copy, Clone)]
+    struct XcbStateContext {
+        fd: i32,
+        // marker_: core::marker::PhantomPinned,
+    }
+
+    let mut xcb_state_ctx = XcbStateContext {
+        fd: xcb_fd,
+        // marker_: core::marker::PhantomPinned {},
+    };
+
+    let (epoll_fd,) = unsafe {
+        let epoll_fd = libc::epoll_create(16);
+        assert_ne!(epoll_fd, -1);
+
+        let fd_flags = libc::fcntl(xcb_fd, libc::F_GETFL, 0);
+        dbg!(fd_flags);
+
+        let res = libc::fcntl(xcb_fd, libc::F_SETFL, fd_flags | libc::O_NONBLOCK);
+        assert_ne!(res, -1);
+
+        let mut ev = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLET) as u32,
+            data: libc::epoll_data_t {
+                ptr: &mut xcb_state_ctx as *mut _ as *mut _,
+            },
+        };
+        let op_res = libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, xcb_state_ctx.fd, &mut ev);
+        assert_ne!(op_res, -1);
+        (epoll_fd,)
+    };
+
+    let mut events_buffer: [libc::epoll_event; 8] =
+        unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
+
     'main_loop: loop {
-        let e = unsafe { xcb_wait_for_event(xcb_conn) };
-        if e.is_null() {
-            break 'main_loop;
-        }
-        let event_type = unsafe { (*e).response_type & 0x7F };
-        dbg!(event_type);
-        match event_type {
-            XCB_KEY_PRESS => unsafe {
-                let key_event = *(e as *const xcb_key_press_event_t);
-                dbg!(key_event);
-                if key_event.detail == 9 {
-                    break 'main_loop;
-                }
-            },
-
-            XCB_CLIENT_MESSAGE => unsafe {
-                let cli_msg = *(e as *const xcb_client_message_event_t);
-                if cli_msg.data.data32[0] == atom_wm_delete {
-                    xcb_destroy_window(xcb_conn, windowid);
-                    break 'main_loop;
-                }
-            },
-
-            XCB_EXPOSE => {
-                context.draw(xcb_conn, windowid);
-                unsafe {
-                    xcb_flush(xcb_conn);
-                }
+        unsafe {
+            let events_count = libc::epoll_wait(
+                epoll_fd,
+                events_buffer.as_mut_slice().as_mut_ptr(),
+                core::mem::size_of_val(&events_buffer) as i32,
+                0,
+            );
+            if events_count < 0 {
+                eprintln!("Epoll error!");
+                continue;
+            }
+            if events_count == 0 {
+                continue;
             }
 
-            _ => {}
+            for e in events_buffer[..events_count as usize].iter() {
+                //
+                // event available on descriptor
+                if (e.events & libc::EPOLLIN as u32) != 0 {
+                    let context = e.data.ptr as *const XcbStateContext;
+                    let mut generic_event = core::mem::MaybeUninit::<xcb_generic_event_t>::uninit();
+                    //
+                    // read one xcb event and process it
+                    'read_xcb_fd: loop {
+                        let bytes_read = libc::read(
+                            (*context).fd,
+                            generic_event.as_mut_ptr() as *mut u8,
+                            core::mem::size_of_val(&generic_event),
+                        );
+
+                        if bytes_read == 0 {
+                            eprintln!("0 bytes read ... MonkaHMMMM ...");
+                            break 'read_xcb_fd;
+                        }
+                        if bytes_read == -1 {
+                            if libc::errno() == libc::EAGAIN {
+                                break 'read_xcb_fd;
+                            }
+
+                            eprintln!("Error reading from xcb_fd {}", libc::errno());
+                            break 'read_xcb_fd;
+                        }
+
+                        let generic_event = generic_event.assume_init();
+                        let event_type = generic_event.response_type & 0x7F;
+                        match event_type {
+                            XCB_KEY_PRESS => {
+                                let key_event =
+                                    *(&generic_event as *const _ as *const xcb_key_press_event_t);
+                                dbg!(key_event);
+                                if key_event.detail == 9 {
+                                    break 'main_loop;
+                                }
+                            }
+
+                            XCB_CLIENT_MESSAGE => {
+                                let cli_msg = *(&generic_event as *const _
+                                    as *const xcb_client_message_event_t);
+                                if cli_msg.data.data32[0] == atom_wm_delete {
+                                    xcb_destroy_window(xcb_conn, windowid);
+                                    break 'main_loop;
+                                }
+                            }
+
+                            XCB_EXPOSE => {
+                                app_context.draw(xcb_conn, windowid);
+                            }
+
+                            _ => {}
+                        }
+                        xcb_flush(xcb_conn);
+                    }
+                }
+                //
+                // TODO: maybe handle this better ?
+                if (e.events & libc::EPOLLERR as u32) != 0 {}
+            }
         }
 
-        unsafe {
-            free(e as *mut _);
+        #[cfg(feature = "classic_event_processing")]
+        {
+            let e = unsafe { xcb_wait_for_event(xcb_conn) };
+            if e.is_null() {
+                break 'main_loop;
+            }
+            dbg!(event_type);
+            match event_type {
+                XCB_KEY_PRESS => unsafe {
+                    let key_event = *(e as *const xcb_key_press_event_t);
+                    dbg!(key_event);
+                    if key_event.detail == 9 {
+                        break 'main_loop;
+                    }
+                },
+
+                XCB_CLIENT_MESSAGE => unsafe {
+                    let cli_msg = *(e as *const xcb_client_message_event_t);
+                    if cli_msg.data.data32[0] == atom_wm_delete {
+                        xcb_destroy_window(xcb_conn, windowid);
+                        break 'main_loop;
+                    }
+                },
+
+                XCB_EXPOSE => {
+                    context.draw(xcb_conn, windowid);
+                    unsafe {
+                        xcb_flush(xcb_conn);
+                    }
+                }
+
+                _ => {}
+            }
+
+            unsafe {
+                free(e as *mut _);
+            }
         }
     }
 
