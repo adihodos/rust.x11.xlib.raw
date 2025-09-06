@@ -262,6 +262,22 @@ struct xcb_shm_query_version_cookie_t {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
+struct xcb_shm_create_segment_cookie_t {
+    sequence: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct xcb_shm_create_segment_reply_t {
+    response_type: u8,
+    nfd: u8,
+    sequence: u16,
+    pad0: [u8; 24],
+    length: u32,
+}
+
+#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 struct xcb_shm_query_version_reply_t {
     response_type: u8,
@@ -310,6 +326,20 @@ unsafe extern "C" {
         e: *mut *mut xcb_generic_error_t,
     ) -> *mut xcb_shm_create_segment_reply_t;
 
+    fn xcb_shm_attach(
+        c: *mut xcb_connection_t,
+        shmseg: xcb_shm_seg_t,
+        shmid: u32,
+        read_only: u8,
+    ) -> xcb_void_cookie_t;
+
+    fn xcb_shm_attach_checked(
+        c: *mut xcb_connection_t,
+        shmseg: xcb_shm_seg_t,
+        shmid: u32,
+        read_only: u8,
+    ) -> xcb_void_cookie_t;
+
     fn xcb_generate_id(c: *mut xcb_connection_t) -> xcb_window_t;
     fn xcb_create_window(
         c: *mut xcb_connection_t,
@@ -351,6 +381,7 @@ unsafe extern "C" {
         data: *const core::ffi::c_void,
     ) -> xcb_void_cookie_t;
     fn xcb_destroy_window(c: *mut xcb_connection_t, window: xcb_window_t) -> xcb_void_cookie_t;
+
     fn xcb_request_check(
         c: *mut xcb_connection_t,
         cookie: xcb_void_cookie_t,
@@ -441,7 +472,14 @@ mod libc {
 
         pub fn read(fd: i32, buf: *mut u8, count: usize) -> i32;
 
-        fn shmget(key: i32, size: usize, shmflg: i32) -> i32;
+        pub fn shmget(key: i32, size: usize, shmflg: i32) -> i32;
+        pub fn shmdt(shmaddr: *const core::ffi::c_void) -> i32;
+        pub fn shmat(
+            shmid: i32,
+            shmaddr: *const core::ffi::c_void,
+            shmflg: i32,
+        ) -> *mut core::ffi::c_void;
+        fn shmctl(shmid: i32, op: i32, buf: *mut core::ffi::c_void) -> i32;
 
     }
 
@@ -549,7 +587,7 @@ mod xrandr {
     }
 
     #[link(name = "xcb-randr")]
-    #[link(name = "xcb-util")]
+    // #[link(name = "xcb-util")]
     unsafe extern "C" {
         pub fn xcb_randr_get_monitors(
             c: *mut xcb_connection_t,
@@ -675,7 +713,8 @@ impl SimpleDrawing {
 }
 
 struct DrawingBuffer {
-    shared_mem_id: i32,
+    shm_mem_id: i32,
+    shm_segment_id: xcb_shm_seg_t,
 }
 
 impl DrawingBuffer {
@@ -701,8 +740,8 @@ impl DrawingBuffer {
         let mem_id = unsafe {
             libc::shmget(
                 libc::IPC_PRIVATE,
-                (width * height * bpp) as usize,
-                IPC_CREAT | 0666,
+                (width * height * bpp as u32) as usize,
+                libc::IPC_CREAT | 0666,
             )
         };
 
@@ -710,9 +749,40 @@ impl DrawingBuffer {
             return None;
         }
 
+        unsafe {
+            libc::shmctl(mem_id, IPC_RMID, core::ffi::null_mut());
+        }
+
+        let shm_addr = unsafe { libc::shmat(mem_id, core::ptr::null_mut(), 0) };
+        if shm_addr.is_null() {
+            return None;
+        }
+
         dbg!(shm_ver);
 
-        None
+        let shm_segment_id = unsafe { xcb_generate_id(conn) };
+        // let shm_seg_cookie =
+        //     unsafe { xcb_shm_create_segment(conn, shm_segment_id, width * height * bpp as u32, 0) };
+        // let shm_seg_reply =
+        //     unsafe { xcb_shm_create_segment_reply(conn, shm_seg_cookie, core::ptr::null_mut()) };
+        // if shm_seg_reply.is_null() {
+        //     return None;
+        // }
+
+        unsafe {
+            let cookie = xcb_shm_attach_checked(conn, shm_segment_id, mem_id as u32, 0);
+            let err = xcb_request_check(conn, cookie);
+            if !err.is_null() {
+                dbg!(*err);
+                libc::free(err as *mut _);
+                return None;
+            }
+        };
+
+        Some(DrawingBuffer {
+            shm_segment_id,
+            shm_mem_id: mem_id,
+        })
     }
 }
 
@@ -825,7 +895,13 @@ fn main() {
         );
     }
 
-    let draw_buffer = DrawingBuffer::create(xcb_conn);
+    let draw_buffer = DrawingBuffer::create(
+        xcb_conn,
+        &visual,
+        width as u32,
+        height as u32,
+        bits_per_pixel,
+    );
     let mut app_context = SimpleDrawing::new(xcb_conn, windowid).unwrap();
 
     unsafe {
