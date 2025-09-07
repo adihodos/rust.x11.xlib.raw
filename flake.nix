@@ -51,6 +51,8 @@
 
           xorg.libxcb
           xorg.libxcb.dev
+          xorg.xcbutilimage
+          xorg.xcbutilimage.dev
           xorg.libX11
           xorg.libX11.dev
           xorg.xcbutil.dev

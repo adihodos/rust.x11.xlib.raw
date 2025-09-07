@@ -41,6 +41,21 @@ const XCB_GC_BACKGROUND: u32 = 8;
 const XCB_GC_LINE_WIDTH: u32 = 16;
 const XCB_GC_GRAPHICS_EXPOSURES: u32 = 65536;
 
+#[repr(i32)]
+#[derive(Copy, Clone, Debug)]
+enum xcb_image_format_t {
+    XCB_IMAGE_FORMAT_XY_BITMAP = 0,
+    XCB_IMAGE_FORMAT_XY_PIXMAP = 1,
+    XCB_IMAGE_FORMAT_Z_PIXMAP = 2,
+}
+
+#[repr(i32)]
+#[derive(Copy, Clone, Debug)]
+enum xcb_image_order_t {
+    XCB_IMAGE_ORDER_LSB_FIRST = 0,
+    XCB_IMAGE_ORDER_MSB_FIRST = 1,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 union xcb_client_message_data_t {
@@ -239,7 +254,7 @@ struct xcb_depth_iterator_t {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct xcb_format_t {
     depth: u8,
     bits_per_pixel: u8,
@@ -292,8 +307,29 @@ struct xcb_shm_query_version_reply_t {
     pad0: [u8; 15],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct xcb_image_t {
+    width: u16,
+    height: u16,
+    format: i32,
+    scanline_pad: u8,
+    depth: u8,
+    bpp: u8,
+    unit: u8,
+    plane_mask: u32,
+    byte_order: i32,
+    bit_order: i32,
+    stride: u32,
+    size: u32,
+    base: *mut core::ffi::c_void,
+    data: *mut u8,
+}
+
 #[link(name = "xcb")]
 #[link(name = "xcb-shm")]
+#[link(name = "xcb-util")]
+#[link(name = "xcb-image")]
 unsafe extern "C" {
     fn xcb_connect(displayname: *const u8, screenp: *mut i32) -> *mut xcb_connection_t;
     fn xcb_get_file_descriptor(c: *mut xcb_connection_t) -> i32;
@@ -340,7 +376,42 @@ unsafe extern "C" {
         read_only: u8,
     ) -> xcb_void_cookie_t;
 
+    fn xcb_shm_put_image(
+        conn: *mut xcb_connection_t,
+        drawable: xcb_drawable_t,
+        gc: xcb_gcontext_t,
+        total_width: u16,
+        total_height: u16,
+        src_x: u16,
+        src_y: u16,
+        src_width: u16,
+        src_height: u16,
+        dst_x: i16,
+        dst_y: i16,
+        depth: u8,
+        format: u8,
+        send_event: u8,
+        shmseg: xcb_shm_seg_t,
+        offset: u32,
+    ) -> xcb_void_cookie_t;
+
+    fn xcb_image_create(
+        width: u16,
+        height: u16,
+        format: xcb_image_format_t,
+        xpad: u8,
+        depth: u8,
+        bpp: u8,
+        unit: u8,
+        byte_order: xcb_image_order_t,
+        bit_order: xcb_image_order_t,
+        base: *mut core::ffi::c_void,
+        bytes: u32,
+        data: *mut u8,
+    ) -> *mut xcb_image_t;
+
     fn xcb_generate_id(c: *mut xcb_connection_t) -> xcb_window_t;
+
     fn xcb_create_window(
         c: *mut xcb_connection_t,
         depth: u8,
@@ -356,20 +427,26 @@ unsafe extern "C" {
         value_mask: u32,
         value_list: *const core::ffi::c_void,
     ) -> xcb_void_cookie_t;
+
     fn xcb_wait_for_event(c: *mut xcb_connection_t) -> *mut xcb_generic_event_t;
+
     fn xcb_map_window(c: *mut xcb_connection_t, window: xcb_window_t) -> xcb_void_cookie_t;
+
     fn xcb_flush(c: *mut xcb_connection_t) -> i32;
+
     fn xcb_intern_atom(
         c: *mut xcb_connection_t,
         only_if_exists: u8,
         name_len: u16,
         name: *const u8,
     ) -> xcb_intern_atom_cookie_t;
+
     fn xcb_intern_atom_reply(
         c: *mut xcb_connection_t,
         cookie: xcb_intern_atom_cookie_t,
         e: *mut *mut xcb_generic_error_t,
     ) -> *mut xcb_intern_atom_reply_t;
+
     fn xcb_change_property(
         conn: *mut xcb_connection_t,
         mode: u8,
@@ -380,6 +457,7 @@ unsafe extern "C" {
         data_len: u32,
         data: *const core::ffi::c_void,
     ) -> xcb_void_cookie_t;
+
     fn xcb_destroy_window(c: *mut xcb_connection_t, window: xcb_window_t) -> xcb_void_cookie_t;
 
     fn xcb_request_check(
@@ -460,6 +538,7 @@ mod libc {
 
     pub const IPC_CREAT: i32 = 00001000;
     pub const IPC_PRIVATE: i32 = 0;
+    pub const IPC_RMID: i32 = 0;
 
     unsafe extern "C" {
         pub fn free(ptr: *mut core::ffi::c_void);
@@ -479,7 +558,7 @@ mod libc {
             shmaddr: *const core::ffi::c_void,
             shmflg: i32,
         ) -> *mut core::ffi::c_void;
-        fn shmctl(shmid: i32, op: i32, buf: *mut core::ffi::c_void) -> i32;
+        pub fn shmctl(shmid: i32, op: i32, buf: *mut core::ffi::c_void) -> i32;
 
     }
 
@@ -512,7 +591,7 @@ fn get_xcb_atom_by_name(xcb_conn: *mut xcb_connection_t, atom_name: &[u8]) -> xc
 fn get_xcb_visual(
     screen: &xcb_screen_t,
     setup: &xcb_setup_t,
-) -> std::option::Option<(xcb_visualtype_t, u8)> {
+) -> std::option::Option<(xcb_visualtype_t, xcb_format_t)> {
     let screen_depths = unsafe {
         let iter = xcb_screen_allowed_depths_iterator(screen as *const _);
         core::slice::from_raw_parts(iter.data, iter.rem as usize)
@@ -538,7 +617,7 @@ fn get_xcb_visual(
     let pixel_fmt = pixel_formats
         .iter()
         .find(|pixfmt| return pixfmt.depth == screen.root_depth)?;
-    Some((*visual, pixel_fmt.depth))
+    Some((*visual, *pixel_fmt))
 }
 
 mod xrandr {
@@ -587,7 +666,7 @@ mod xrandr {
     }
 
     #[link(name = "xcb-randr")]
-    // #[link(name = "xcb-util")]
+
     unsafe extern "C" {
         pub fn xcb_randr_get_monitors(
             c: *mut xcb_connection_t,
@@ -715,6 +794,7 @@ impl SimpleDrawing {
 struct DrawingBuffer {
     shm_mem_id: i32,
     shm_segment_id: xcb_shm_seg_t,
+    image: xcb_image_t,
 }
 
 impl DrawingBuffer {
@@ -723,7 +803,7 @@ impl DrawingBuffer {
         visual: &xcb_visualtype_t,
         width: u32,
         height: u32,
-        bpp: u8,
+        pixel_format: &xcb_format_t,
     ) -> Option<DrawingBuffer> {
         let shm_ver = unsafe {
             let query_cookie = xcb_shm_query_version(conn);
@@ -736,12 +816,35 @@ impl DrawingBuffer {
             libc::free(qquery_repl as *mut _);
             res
         };
+        dbg!(shm_ver);
 
+        let mut img_data = unsafe {
+            let img_data = xcb_image_create(
+                width as u16,
+                height as u16,
+                xcb_image_format_t::XCB_IMAGE_FORMAT_Z_PIXMAP,
+                pixel_format.scanline_pad,
+                pixel_format.depth,
+                pixel_format.bits_per_pixel,
+                0,
+                xcb_image_order_t::XCB_IMAGE_ORDER_MSB_FIRST,
+                xcb_image_order_t::XCB_IMAGE_ORDER_MSB_FIRST,
+                core::ptr::null_mut(),
+                !0,
+                core::ptr::null_mut(),
+            );
+            assert_ne!(img_data, core::ptr::null_mut());
+            let data = *img_data;
+            libc::free(img_data as *mut _);
+            data
+        };
+
+        dbg!(img_data);
         let mem_id = unsafe {
             libc::shmget(
                 libc::IPC_PRIVATE,
-                (width * height * bpp as u32) as usize,
-                libc::IPC_CREAT | 0666,
+                (img_data.stride * img_data.height as u32) as usize,
+                libc::IPC_CREAT | 0600,
             )
         };
 
@@ -749,25 +852,17 @@ impl DrawingBuffer {
             return None;
         }
 
-        unsafe {
-            libc::shmctl(mem_id, IPC_RMID, core::ffi::null_mut());
-        }
-
         let shm_addr = unsafe { libc::shmat(mem_id, core::ptr::null_mut(), 0) };
-        if shm_addr.is_null() {
+        if shm_addr == unsafe { core::mem::transmute::<_, *mut core::ffi::c_void>(usize::MAX) } {
+            eprintln!("Failed to shmat !!!");
             return None;
         }
-
-        dbg!(shm_ver);
+        unsafe {
+            libc::shmctl(mem_id, libc::IPC_RMID, core::ptr::null_mut());
+        }
+        img_data.data = shm_addr as *mut u8;
 
         let shm_segment_id = unsafe { xcb_generate_id(conn) };
-        // let shm_seg_cookie =
-        //     unsafe { xcb_shm_create_segment(conn, shm_segment_id, width * height * bpp as u32, 0) };
-        // let shm_seg_reply =
-        //     unsafe { xcb_shm_create_segment_reply(conn, shm_seg_cookie, core::ptr::null_mut()) };
-        // if shm_seg_reply.is_null() {
-        //     return None;
-        // }
 
         unsafe {
             let cookie = xcb_shm_attach_checked(conn, shm_segment_id, mem_id as u32, 0);
@@ -782,8 +877,61 @@ impl DrawingBuffer {
         Some(DrawingBuffer {
             shm_segment_id,
             shm_mem_id: mem_id,
+            image: img_data,
         })
     }
+
+    fn draw(&mut self, draw_context: &DrawingContext) {
+        let (width, height) = (self.image.width as isize, self.image.height as isize);
+        for y in 0..height {
+            for x in 0..width {
+                let base_addr = ((y * width) * 4 + x * 4) as isize;
+                unsafe {
+                    self.image
+                        .data
+                        .offset(base_addr + 0)
+                        .write(((x + y) % 255) as u8);
+                    self.image
+                        .data
+                        .offset(base_addr + 1)
+                        .write(((x * y) % 255) as u8);
+                    self.image
+                        .data
+                        .offset(base_addr + 2)
+                        .write(((x ^ y) % 255) as u8);
+                    self.image.data.offset(base_addr + 3).write(255);
+                }
+            }
+        }
+        unsafe {
+            xcb_shm_put_image(
+                draw_context.conn,
+                draw_context.window,
+                draw_context.gc,
+                self.image.width as u16,
+                self.image.height as u16,
+                0,
+                0,
+                self.image.width as u16,
+                self.image.height as u16,
+                0,
+                0,
+                self.image.depth,
+                self.image.format as u8,
+                0,
+                self.shm_segment_id,
+                0,
+            );
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct DrawingContext {
+    conn: *mut xcb_connection_t,
+    window: xcb_window_t,
+    gc: xcb_gcontext_t,
+    canvas_size: (u16, u16),
 }
 
 fn main() {
@@ -817,9 +965,9 @@ fn main() {
 
     let screen = roots_iter.first().unwrap();
     dbg!(screen);
-    let (visual, bits_per_pixel) = get_xcb_visual(&screen, unsafe { &*xcb_setup }).unwrap();
+    let (visual, pixel_format) = get_xcb_visual(&screen, unsafe { &*xcb_setup }).unwrap();
     dbg!(visual);
-    dbg!(bits_per_pixel);
+    dbg!(pixel_format);
 
     let monitors_repl_cookie =
         unsafe { xrandr::xcb_randr_get_monitors(xcb_conn, screen.root, true as u8) };
@@ -895,13 +1043,14 @@ fn main() {
         );
     }
 
-    let draw_buffer = DrawingBuffer::create(
+    let mut draw_buffer = DrawingBuffer::create(
         xcb_conn,
         &visual,
         width as u32,
         height as u32,
-        bits_per_pixel,
-    );
+        &pixel_format,
+    )
+    .unwrap();
     let mut app_context = SimpleDrawing::new(xcb_conn, windowid).unwrap();
 
     unsafe {
@@ -1010,7 +1159,13 @@ fn main() {
                             }
 
                             XCB_EXPOSE => {
-                                app_context.draw(xcb_conn, windowid);
+                                // app_context.draw(xcb_conn, windowid);
+                                draw_buffer.draw(&DrawingContext {
+                                    conn: xcb_conn,
+                                    window: windowid,
+                                    gc: app_context.gc,
+                                    canvas_size: (width, height),
+                                });
                             }
 
                             _ => {}
