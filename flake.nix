@@ -1,3 +1,4 @@
+
 {
   description = "A Nix-flake-based Rust development environment";
 
@@ -53,6 +54,7 @@
           xorg.libxcb.dev
           xorg.xcbutilimage
           xorg.xcbutilimage.dev
+          xorg.xcbutilerrors.dev
           xorg.libX11
           xorg.libX11.dev
           xorg.xcbutil.dev

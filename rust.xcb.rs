@@ -7,6 +7,12 @@ struct xcb_connection_t {
     _marker: core::marker::PhantomData<(*mut u8, core::marker::PhantomPinned)>,
 }
 
+#[repr(C)]
+struct xcb_errors_context_t {
+    _data: (),
+    _marker: core::marker::PhantomData<(*mut u8, core::marker::PhantomPinned)>,
+}
+
 type xcb_window_t = u32;
 type xcb_colormap_t = u32;
 type xcb_visualid_t = u32;
@@ -330,12 +336,41 @@ struct xcb_image_t {
 #[link(name = "xcb-shm")]
 #[link(name = "xcb-util")]
 #[link(name = "xcb-image")]
+#[link(name = "xcb-errors")]
 unsafe extern "C" {
     fn xcb_connect(displayname: *const u8, screenp: *mut i32) -> *mut xcb_connection_t;
     fn xcb_get_file_descriptor(c: *mut xcb_connection_t) -> i32;
     fn xcb_disconnect(c: *mut xcb_connection_t);
     fn xcb_get_setup(c: *mut xcb_connection_t) -> *const xcb_setup_t;
     fn xcb_setup_roots_iterator(r: *const xcb_setup_t) -> xcb_screen_iterator_t;
+
+    fn xcb_errors_context_new(
+        conn: *mut xcb_connection_t,
+        ctx: *mut *mut xcb_errors_context_t,
+    ) -> i32;
+
+    fn xcb_errors_get_name_for_major_code(
+        ctx: *mut xcb_errors_context_t,
+        major_code: u8,
+    ) -> *const u8;
+
+    fn xcb_errors_get_name_for_minor_code(
+        ctx: *mut xcb_errors_context_t,
+        major_code: u8,
+        minor_code: u16,
+    ) -> *const u8;
+
+    fn xcb_errors_get_name_for_xcb_event(
+        ctx: *mut xcb_errors_context_t,
+        event: *mut xcb_generic_event_t,
+        extension: *mut *mut u8,
+    ) -> *const u8;
+
+    fn xcb_errors_get_name_for_error(
+        ctx: *mut xcb_errors_context_t,
+        error_code: u8,
+        extension: *mut *mut u8,
+    ) -> *mut u8;
 
     fn xcb_screen_next(i: *mut xcb_screen_iterator_t);
     fn xcb_screen_allowed_depths_iterator(R: *const xcb_screen_t) -> xcb_depth_iterator_t;
@@ -543,6 +578,7 @@ mod libc {
     unsafe extern "C" {
         pub fn free(ptr: *mut core::ffi::c_void);
         pub fn fcntl(fildes: i32, cmd: i32, ...) -> i32;
+        pub fn printf(args_fmt: *const u8, ...) -> i32;
 
         pub fn epoll_create(size: i32) -> i32;
         pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, epoll_event: *mut epoll_event) -> i32;
@@ -1090,6 +1126,13 @@ fn main() {
         (epoll_fd,)
     };
 
+    let err_ctx = unsafe {
+        let mut err_ctx: *mut xcb_errors_context_t = core::ptr::null_mut();
+        let result = xcb_errors_context_new(xcb_conn, &mut err_ctx);
+        assert_ne!(result, -1);
+        err_ctx
+    };
+
     let mut events_buffer: [libc::epoll_event; 8] =
         unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
 
@@ -1139,7 +1182,41 @@ fn main() {
 
                         let generic_event = generic_event.assume_init();
                         let event_type = generic_event.response_type & 0x7F;
+
                         match event_type {
+                            0 => {
+                                let mut err_event =
+                                    *(&generic_event as *const _ as *const xcb_generic_error_t);
+                                let major_code_desc = xcb_errors_get_name_for_major_code(
+                                    err_ctx,
+                                    err_event.major_code,
+                                );
+                                let minor_code_desc = xcb_errors_get_name_for_minor_code(
+                                    err_ctx,
+                                    err_event.major_code,
+                                    err_event.minor_code,
+                                );
+                                let event_desc = xcb_errors_get_name_for_xcb_event(
+                                    err_ctx,
+                                    &mut err_event as *mut _ as *mut xcb_generic_event_t,
+                                    core::ptr::null_mut(),
+                                );
+                                let error_desc = xcb_errors_get_name_for_error(
+                                    err_ctx,
+                                    err_event.error_code,
+                                    core::ptr::null_mut(),
+                                );
+
+                                libc::printf(
+                                    b"\n[Error]:: %s\nmajor code: %s\nminor code: %s\nevent: %s \0"
+                                        .as_ptr(),
+                                    error_desc,
+                                    major_code_desc,
+                                    minor_code_desc,
+                                    event_desc,
+                                );
+                            }
+
                             XCB_KEY_PRESS => {
                                 let key_event =
                                     *(&generic_event as *const _ as *const xcb_key_press_event_t);
