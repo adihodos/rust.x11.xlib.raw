@@ -189,6 +189,21 @@ struct xcb_generic_event_t {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
+struct xcb_expose_event_t {
+    response_type: u8,
+    pad0: u8,
+    sequence: u16,
+    window: xcb_window_t,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    count: u16,
+    pad1: [u8; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
 struct xcb_generic_error_t {
     response_type: u8,
     error_code: u8,
@@ -577,14 +592,13 @@ mod libc {
 
     unsafe extern "C" {
         pub fn free(ptr: *mut core::ffi::c_void);
-        pub fn fcntl(fildes: i32, cmd: i32, ...) -> i32;
-        pub fn printf(args_fmt: *const u8, ...) -> i32;
 
         pub fn epoll_create(size: i32) -> i32;
         pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, epoll_event: *mut epoll_event) -> i32;
         pub fn epoll_wait(epfd: i32, events: *mut epoll_event, maxevents: i32, timeout: i32)
             -> i32;
 
+        pub fn fcntl(fildes: i32, cmd: i32, ...) -> i32;
         pub fn read(fd: i32, buf: *mut u8, count: usize) -> i32;
 
         pub fn shmget(key: i32, size: usize, shmflg: i32) -> i32;
@@ -917,24 +931,35 @@ impl DrawingBuffer {
         })
     }
 
+    fn hsv_to_rgb(hue: f32, s: f32, v: f32) -> (u8, u8, u8) {
+        let f = |n: f32| {
+            let k = (n + hue / 60f32) % 6f32;
+            let r = v - v * s * ((k.min(4f32 - k)).min(1f32)).max(0f32);
+            (r * 256f32) as u8
+        };
+
+        (f(5f32), f(3f32), f(1f32))
+    }
+
     fn draw(&mut self, draw_context: &DrawingContext) {
         let (width, height) = (self.image.width as isize, self.image.height as isize);
         for y in 0..height {
             for x in 0..width {
                 let base_addr = ((y * width) * 4 + x * 4) as isize;
+                let hue = ((x ^ y) % 360) as f32;
+
+                let (r, g, b) = Self::hsv_to_rgb(hue, 1f32, 1f32);
+
+                // (
+                //     ((x + y) % 255) as u8,
+                //     ((x * y) % 255) as u8,
+                //     ((x ^ y) % 255) as u8,
+                // );
+
                 unsafe {
-                    self.image
-                        .data
-                        .offset(base_addr + 0)
-                        .write(((x + y) % 255) as u8);
-                    self.image
-                        .data
-                        .offset(base_addr + 1)
-                        .write(((x * y) % 255) as u8);
-                    self.image
-                        .data
-                        .offset(base_addr + 2)
-                        .write(((x ^ y) % 255) as u8);
+                    self.image.data.offset(base_addr + 0).write(r);
+                    self.image.data.offset(base_addr + 1).write(g);
+                    self.image.data.offset(base_addr + 2).write(b);
                     self.image.data.offset(base_addr + 3).write(255);
                 }
             }
@@ -1207,13 +1232,21 @@ fn main() {
                                     core::ptr::null_mut(),
                                 );
 
-                                libc::printf(
-                                    b"\n[Error]:: %s\nmajor code: %s\nminor code: %s\nevent: %s \0"
-                                        .as_ptr(),
-                                    error_desc,
-                                    major_code_desc,
-                                    minor_code_desc,
-                                    event_desc,
+                                use std::ffi::CStr;
+                                eprintln!(
+                                    "XCB error:: {}\nmajor code: {}\nminor code: {}\nevent: {}",
+                                    CStr::from_ptr(error_desc as *const _)
+                                        .to_str()
+                                        .unwrap_or_default(),
+                                    CStr::from_ptr(major_code_desc as *const _)
+                                        .to_str()
+                                        .unwrap_or_default(),
+                                    CStr::from_ptr(minor_code_desc as *const _)
+                                        .to_str()
+                                        .unwrap_or_default(),
+                                    CStr::from_ptr(event_desc as *const _)
+                                        .to_str()
+                                        .unwrap_or_default(),
                                 );
                             }
 
@@ -1236,7 +1269,8 @@ fn main() {
                             }
 
                             XCB_EXPOSE => {
-                                // app_context.draw(xcb_conn, windowid);
+                                let e = *(&generic_event as *const _ as *const xcb_expose_event_t);
+                                eprintln!("Expose event: {:?}", e);
                                 draw_buffer.draw(&DrawingContext {
                                     conn: xcb_conn,
                                     window: windowid,
